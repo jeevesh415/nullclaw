@@ -432,6 +432,7 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
     const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
     for (env_vars) |var_name| {
         if (std.process.getEnvVarOwned(allocator, var_name)) |val| {
+            errdefer allocator.free(val);
             const out = try normalizeProxyEnvValue(allocator, val);
             allocator.free(val);
             if (out) |proxy| return proxy;

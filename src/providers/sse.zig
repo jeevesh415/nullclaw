@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const http_util = @import("../http_util.zig");
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -105,7 +106,6 @@ pub fn curlStream(
     argc += 1;
 
     // Add proxy from environment if set
-    const http_util = @import("../http_util.zig");
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
 
@@ -361,6 +361,17 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "Content-Type: application/json";
     argc += 1;
+
+    // Add proxy from environment if set
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    if (proxy) |p| {
+        argv_buf[argc] = "--proxy";
+        argc += 1;
+        argv_buf[argc] = p;
+        argc += 1;
+    }
 
     for (headers) |hdr| {
         argv_buf[argc] = "-H";

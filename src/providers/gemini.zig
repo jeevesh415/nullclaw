@@ -3,6 +3,7 @@ const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -657,6 +658,17 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "Content-Type: application/json";
         argc += 1;
+
+        // Add proxy from environment if set
+        const proxy = http_util.getProxyFromEnv(allocator) catch null;
+        defer if (proxy) |p| allocator.free(p);
+
+        if (proxy) |p| {
+            argv_buf[argc] = "--proxy";
+            argc += 1;
+            argv_buf[argc] = p;
+            argc += 1;
+        }
 
         for (headers) |hdr| {
             argv_buf[argc] = "-H";
