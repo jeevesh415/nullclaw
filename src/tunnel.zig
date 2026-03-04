@@ -193,8 +193,8 @@ fn tryReadUrlFromPipe(allocator: std.mem.Allocator, pipe: std.fs.File, timeout_n
     defer poller.deinit();
 
     const pipe_reader = poller.reader(.pipe);
-    var read_buf: [URL_READ_BUFFER_BYTES]u8 = undefined;
-    pipe_reader.buffer = &read_buf;
+    // Reader buffer is owned/freed by poller.deinit(); keep it heap-managed.
+    pipe_reader.buffer = &.{};
     pipe_reader.seek = 0;
     pipe_reader.end = 0;
 
@@ -207,7 +207,7 @@ fn tryReadUrlFromPipe(allocator: std.mem.Allocator, pipe: std.fs.File, timeout_n
             return allocator.dupe(u8, found_url) catch null;
         }
 
-        if (output.len >= pipe_reader.buffer.len) return null;
+        if (output.len > URL_READ_BUFFER_BYTES) return null;
         if (!keep_polling) return null;
 
         const elapsed_ns: i128 = std.time.nanoTimestamp() - started_at_ns;
@@ -1083,6 +1083,29 @@ test "extractUrl returns null for no url" {
 test "extractUrl ignores bare https://" {
     const output = "https:// \nnothing";
     try std.testing.expect(extractUrl(output) == null);
+}
+
+test "tryReadUrlFromPipe extracts URL from stream" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const log_name = "tunnel.log";
+    {
+        const log_file = try tmp.dir.createFile(log_name, .{});
+        defer log_file.close();
+        try log_file.writeAll("booting\nhttps://abc123.trycloudflare.com connected\n");
+    }
+
+    const read_file = try tmp.dir.openFile(log_name, .{});
+    defer read_file.close();
+
+    const url = tryReadUrlFromPipe(std.testing.allocator, read_file, std.time.ns_per_s) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://abc123.trycloudflare.com", url);
 }
 
 // ── TunnelAdapter vtable tests ──────────────────────────────────
