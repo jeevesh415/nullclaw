@@ -6,6 +6,7 @@ const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const streaming = @import("../streaming.zig");
+const telegram_draft_presenter = @import("telegram_draft_presenter.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -19,8 +20,6 @@ const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 16 * 1024;
 const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 500;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
-const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
-const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"commands":[
     \\{"command":"start","description":"Start a conversation"},
@@ -127,16 +126,7 @@ const PendingInteraction = struct {
     }
 };
 
-const DraftState = struct {
-    draft_id: u64,
-    buffer: std.ArrayListUnmanaged(u8) = .empty,
-    last_flush_len: usize = 0,
-    last_flush_time: i64 = 0,
-
-    fn deinit(self: *DraftState, allocator: std.mem.Allocator) void {
-        self.buffer.deinit(allocator);
-    }
-};
+const DraftState = telegram_draft_presenter.DraftState;
 
 /// Infer attachment kind from file extension.
 pub fn inferAttachmentKindFromExtension(path: []const u8) AttachmentKind {
@@ -2585,17 +2575,12 @@ pub const TelegramChannel = struct {
     // ── Draft streaming (sendMessageDraft) ─────────────────────────
 
     fn deinitDraftBuffers(self: *TelegramChannel) void {
-        var it = self.draft_buffers.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.draft_buffers.deinit(self.allocator);
+        telegram_draft_presenter.deinitDraftBuffers(self.allocator, &self.draft_buffers);
     }
 
     fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8) void {
         if (builtin.is_test) return;
-        if (text.len == 0 or std.mem.trimLeft(u8, text, " \t\n\r").len == 0) return;
+        if (!telegram_draft_presenter.hasVisibleDraftText(text)) return;
 
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "sendMessageDraft") catch return;
@@ -2659,42 +2644,39 @@ pub const TelegramChannel = struct {
 
         switch (stage) {
             .chunk => {
-                if (message.len == 0) return;
+                var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
+                defer if (pending_flush) |*flush| flush.deinit(self.allocator);
 
-                self.draft_mu.lock();
-                defer self.draft_mu.unlock();
+                {
+                    self.draft_mu.lock();
+                    defer self.draft_mu.unlock();
 
-                const gop = try self.draft_buffers.getOrPut(self.allocator, target);
-                if (!gop.found_existing) {
-                    const key_copy = try self.allocator.dupe(u8, target);
-                    gop.key_ptr.* = key_copy;
-                    gop.value_ptr.* = .{
-                        .draft_id = self.draft_id_counter.fetchAdd(1, .monotonic),
-                    };
+                    const gop = try self.draft_buffers.getOrPut(self.allocator, target);
+                    if (!gop.found_existing) {
+                        const key_copy = try self.allocator.dupe(u8, target);
+                        gop.key_ptr.* = key_copy;
+                        gop.value_ptr.* = .{
+                            .draft_id = self.draft_id_counter.fetchAdd(1, .monotonic),
+                        };
+                    }
+
+                    pending_flush = try telegram_draft_presenter.appendDraftChunk(
+                        self.allocator,
+                        gop.value_ptr,
+                        message,
+                        std.time.milliTimestamp(),
+                    );
                 }
 
-                try gop.value_ptr.buffer.appendSlice(self.allocator, message);
-
-                const delta = gop.value_ptr.buffer.items.len - gop.value_ptr.last_flush_len;
-                const now_ms = std.time.milliTimestamp();
-                const elapsed_ms = now_ms - gop.value_ptr.last_flush_time;
-
-                if (delta >= DRAFT_FLUSH_MIN_DELTA_BYTES or elapsed_ms >= DRAFT_FLUSH_MIN_INTERVAL_MS) {
-                    self.sendDraft(target, gop.value_ptr.draft_id, gop.value_ptr.buffer.items);
-                    gop.value_ptr.last_flush_len = gop.value_ptr.buffer.items.len;
-                    gop.value_ptr.last_flush_time = now_ms;
+                if (pending_flush) |flush| {
+                    self.sendDraft(target, flush.draft_id, flush.text);
                 }
             },
             .final => {
                 {
                     self.draft_mu.lock();
                     defer self.draft_mu.unlock();
-
-                    if (self.draft_buffers.fetchRemove(target)) |entry| {
-                        self.allocator.free(entry.key);
-                        var draft = entry.value;
-                        draft.deinit(self.allocator);
-                    }
+                    telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, target);
                 }
                 // Forward the final message through the normal send path.
                 // Once sendEvent is set in the vtable, the Channel wrapper no
