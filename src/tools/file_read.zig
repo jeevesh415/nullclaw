@@ -36,10 +36,15 @@ const EXTENSION_TYPES: []const struct { []const u8, []const u8 } = &.{
     .{ ".jpeg", "JPEG image" },
     .{ ".gif", "GIF image" },
     .{ ".webp", "WebP image" },
+    .{ ".avif", "AVIF image" },
+    .{ ".heic", "HEIC image" },
+    .{ ".heif", "HEIF image" },
     .{ ".pdf", "PDF document" },
     .{ ".zip", "ZIP archive" },
     .{ ".mp4", "MP4 video" },
+    .{ ".mov", "QuickTime video" },
     .{ ".mp3", "MP3 audio" },
+    .{ ".m4a", "M4A audio" },
     .{ ".wav", "WAV audio" },
     .{ ".exe", "Windows executable" },
     .{ ".dll", "Windows DLL" },
@@ -53,7 +58,7 @@ fn isWebP(data: []const u8) bool {
         std.mem.eql(u8, data[8..12], "WEBP");
 }
 
-fn isMp4(data: []const u8) bool {
+fn hasIsoBmffHeader(data: []const u8) bool {
     return data.len >= 8 and std.mem.eql(u8, data[4..8], "ftyp");
 }
 
@@ -65,7 +70,7 @@ fn isBinaryContent(data: []const u8) bool {
     }
 
     if (isWebP(data)) return true;
-    if (isMp4(data)) return true;
+    if (hasIsoBmffHeader(data)) return true;
 
     const check_len = @min(data.len, 8192);
     for (data[0..check_len]) |byte| {
@@ -80,13 +85,13 @@ fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
         if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
     }
 
-    if (isWebP(data)) return "WebP image";
-    if (isMp4(data)) return "MP4 video";
-
     const ext = std.fs.path.extension(path);
     for (EXTENSION_TYPES) |entry| {
         if (std.mem.eql(u8, ext, entry[0])) return entry[1];
     }
+
+    if (isWebP(data)) return "WebP image";
+    if (hasIsoBmffHeader(data)) return "ISO media container";
 
     return "binary file";
 }
@@ -440,4 +445,29 @@ test "file_read reports WebP files as WebP" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "WebP image") != null);
+}
+
+test "file_read reports HEIC files as HEIC instead of MP4" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const heic_data = [_]u8{
+        0x00, 0x00, 0x00, 0x18, 'f',  't',  'y',  'p',
+        'h',  'e',  'i',  'c',  0x00, 0x00, 0x00, 0x00,
+    };
+    try tmp_dir.dir.writeFile(.{ .sub_path = "photo.heic", .data = &heic_data });
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var ft = FileReadTool{ .workspace_dir = ws_path };
+    const parsed = try root.parseTestArgs("{\"path\": \"photo.heic\"}");
+    defer parsed.deinit();
+    const result = try ft.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "HEIC image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "MP4 video") == null);
 }
