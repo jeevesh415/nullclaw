@@ -695,9 +695,7 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
 }
 
 fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or
-        std.mem.eql(u8, channel, "telegram") or
-        std.mem.eql(u8, channel, "dingtalk");
+    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
 }
 
 fn makeAssistantReplyOutbound(
@@ -1111,19 +1109,6 @@ test "makeStreamingSinkForChannel returns null for unsupported channel" {
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink == null);
-}
-
-test "makeStreamingSinkForChannel enables dingtalk" {
-    const Noop = struct {
-        fn callback(_: *anyopaque, _: streaming.Event) void {}
-    };
-
-    var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("dingtalk", .{
-        .callback = Noop.callback,
-        .ctx = undefined,
-    }, &filter);
-    try std.testing.expect(sink != null);
 }
 
 test "hasSupervisedChannels false for defaults" {
