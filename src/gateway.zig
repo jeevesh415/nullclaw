@@ -1276,6 +1276,31 @@ fn slackParseCallbackValue(value: []const u8) ?struct { token: []const u8, optio
     return .{ .token = token, .option_index = option_index };
 }
 
+const SlackInteractiveTarget = struct {
+    channel_id: []const u8,
+    thread_id: ?[]const u8 = null,
+    is_dm: bool,
+};
+
+fn slackInteractiveTarget(target: []const u8, fallback_channel_id: []const u8) SlackInteractiveTarget {
+    var channel_id = if (target.len > 0) target else fallback_channel_id;
+    var thread_id: ?[]const u8 = null;
+
+    if (std.mem.indexOfScalar(u8, channel_id, ':')) |idx| {
+        if (idx > 0) {
+            const parsed_thread = channel_id[idx + 1 ..];
+            channel_id = channel_id[0..idx];
+            if (parsed_thread.len > 0) thread_id = parsed_thread;
+        }
+    }
+
+    return .{
+        .channel_id = channel_id,
+        .thread_id = thread_id,
+        .is_dm = channel_id.len > 0 and channel_id[0] == 'D',
+    };
+}
+
 fn whatsappSessionKey(buf: []u8, body: []const u8) []const u8 {
     const sender = jsonStringField(body, "from") orelse "unknown";
     const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
@@ -2273,7 +2298,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const effective_body = if (std.mem.startsWith(u8, body, "payload="))
+    const content_type = extractHeader(ctx.raw_request, "Content-Type");
+    const is_form_payload = if (content_type) |header_value| blk: {
+        const semi = std.mem.indexOfScalar(u8, header_value, ';') orelse header_value.len;
+        const base = std.mem.trim(u8, header_value[0..semi], " \t\r\n");
+        break :blk asciiEqlIgnoreCase(base, "application/x-www-form-urlencoded");
+    } else false;
+
+    const effective_body = if (is_form_payload)
         slackDecodeInteractivePayload(ctx.req_allocator, body) orelse {
             ctx.response_body = "{\"status\":\"parse_error\"}";
             return;
@@ -2360,29 +2392,46 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                 defer ctx.req_allocator.free(selection.submit_text);
                 defer ctx.req_allocator.free(selection.target);
 
+                const interactive_target = slackInteractiveTarget(selection.target, callback_channel_val.string);
+
                 var key_buf: [256]u8 = undefined;
-                const is_dm = callback_channel_val.string.len > 0 and callback_channel_val.string[0] == 'D';
                 const session_key = slackSessionKeyRouted(
                     ctx.req_allocator,
                     &key_buf,
                     slack_cfg.account_id,
                     sender_id_val.string,
-                    callback_channel_val.string,
-                    is_dm,
+                    interactive_target.channel_id,
+                    interactive_target.is_dm,
                     ctx.config_opt,
                 );
 
                 if (ctx.state.event_bus) |eb| {
                     var meta_buf: [384]u8 = undefined;
-                    const metadata = std.fmt.bufPrint(
-                        &meta_buf,
-                        "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"interactive\":true}}",
-                        .{
-                            slack_cfg.account_id,
-                            if (callback_channel_val.string.len > 0 and callback_channel_val.string[0] == 'D') "true" else "false",
-                            callback_channel_val.string,
-                        },
-                    ) catch null;
+                    const metadata = if (interactive_target.thread_id) |thread_id|
+                        std.fmt.bufPrint(
+                            &meta_buf,
+                            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"thread_id\":\"{s}\",\"interactive\":true}}",
+                            .{
+                                slack_cfg.account_id,
+                                if (interactive_target.is_dm) "true" else "false",
+                                interactive_target.channel_id,
+                                if (interactive_target.is_dm) "direct" else "channel",
+                                if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                                thread_id,
+                            },
+                        ) catch null
+                    else
+                        std.fmt.bufPrint(
+                            &meta_buf,
+                            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"interactive\":true}}",
+                            .{
+                                slack_cfg.account_id,
+                                if (interactive_target.is_dm) "true" else "false",
+                                interactive_target.channel_id,
+                                if (interactive_target.is_dm) "direct" else "channel",
+                                if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                            },
+                        ) catch null;
                     _ = publishToBus(
                         eb,
                         ctx.state.allocator,
@@ -3911,10 +3960,35 @@ test "slackDecodeInteractivePayload decodes form payload json" {
     try std.testing.expectEqualStrings("{\"type\":\"block_actions\",\"actions\":[]}", decoded);
 }
 
+test "slackDecodeInteractivePayload finds payload after other form fields" {
+    const allocator = std.testing.allocator;
+    const decoded = slackDecodeInteractivePayload(
+        allocator,
+        "foo=bar&payload=%7B%22type%22%3A%22block_actions%22%7D",
+    ) orelse return error.TestUnexpectedResult;
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("{\"type\":\"block_actions\"}", decoded);
+}
+
 test "slackParseCallbackValue parses token and option index" {
     const parsed = slackParseCallbackValue("ncslack:abc123:2") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("abc123", parsed.token);
     try std.testing.expectEqual(@as(usize, 2), parsed.option_index);
+}
+
+test "slackInteractiveTarget extracts base channel and thread id" {
+    const parsed = slackInteractiveTarget("C12345:1700.1", "C999");
+    try std.testing.expectEqualStrings("C12345", parsed.channel_id);
+    try std.testing.expect(parsed.thread_id != null);
+    try std.testing.expectEqualStrings("1700.1", parsed.thread_id.?);
+    try std.testing.expect(!parsed.is_dm);
+}
+
+test "slackInteractiveTarget falls back to callback channel id for dm" {
+    const parsed = slackInteractiveTarget("", "D12345");
+    try std.testing.expectEqualStrings("D12345", parsed.channel_id);
+    try std.testing.expect(parsed.thread_id == null);
+    try std.testing.expect(parsed.is_dm);
 }
 
 test "jsonIntField extracts positive integer" {
