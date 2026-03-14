@@ -18,6 +18,14 @@
 const std = @import("std");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
+const log = std.log.scoped(.channels);
+var wildcard_allowlist_warned = std.atomic.Value(bool).init(false);
+
+fn warnWildcardAllowAll() void {
+    if (wildcard_allowlist_warned.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+        log.warn("Channel allowlist contains '*' wildcard; this enables allow-all behavior", .{});
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared Types
@@ -300,7 +308,10 @@ pub fn checkPolicy(policy: ChannelPolicy, sender_id: []const u8, is_dm: bool, is
 /// Check if sender_id is in the given allowlist (case-insensitive, supports "*" wildcard).
 fn inAllowlist(allowlist: []const []const u8, sender_id: []const u8) bool {
     for (allowlist) |entry| {
-        if (std.mem.eql(u8, entry, "*")) return true;
+        if (std.mem.eql(u8, entry, "*")) {
+            warnWildcardAllowAll();
+            return true;
+        }
         if (std.ascii.eqlIgnoreCase(entry, sender_id)) return true;
     }
     return false;
@@ -310,7 +321,10 @@ fn inAllowlist(allowlist: []const []const u8, sender_id: []const u8) bool {
 /// Supports "*" wildcard for allow-all.
 pub fn isAllowed(allowed: []const []const u8, sender: []const u8) bool {
     for (allowed) |a| {
-        if (std.mem.eql(u8, a, "*")) return true;
+        if (std.mem.eql(u8, a, "*")) {
+            warnWildcardAllowAll();
+            return true;
+        }
         if (std.ascii.eqlIgnoreCase(a, sender)) return true;
     }
     return false;
