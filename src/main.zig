@@ -322,12 +322,14 @@ fn isTruthyFlag(value: []const u8) bool {
         std.ascii.eqlIgnoreCase(value, "on");
 }
 
-fn isYoloForceEnabled() bool {
-    if (std.posix.getenv("NULLCLAW_ALLOW_YOLO")) |v| {
-        if (isTruthyFlag(std.mem.span(v))) return true;
+fn isYoloForceEnabled(allocator: std.mem.Allocator) bool {
+    if (yc.platform.getEnvOrNull(allocator, "NULLCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
     }
-    if (std.posix.getenv("OPENCLAW_ALLOW_YOLO")) |v| {
-        if (isTruthyFlag(std.mem.span(v))) return true;
+    if (yc.platform.getEnvOrNull(allocator, "OPENCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
     }
     return false;
 }
@@ -397,7 +399,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    if (!isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, isYoloForceEnabled())) {
+    if (!isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, isYoloForceEnabled(allocator))) {
         std.debug.print(
             "Refusing to start gateway with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
             .{cfg.gateway.host},
