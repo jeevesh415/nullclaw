@@ -2604,7 +2604,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    errdefer subagent_manager.deinit();
+    var subagent_manager_needs_err_cleanup = true;
+    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
 
     // Create optional memory backend (don't fail if unavailable).
     var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
@@ -2665,6 +2666,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         &.{},
     );
     defer runtime_observer.destroy();
+    subagent_manager_needs_err_cleanup = false;
     defer subagent_manager.deinit();
     const obs = runtime_observer.observer();
     subagent_manager.observer = runtime_observer.backendObserver();
@@ -3139,7 +3141,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    errdefer subagent_manager.deinit();
+    var subagent_manager_needs_err_cleanup = true;
+    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
 
     // Create optional memory backend (don't fail if unavailable).
     var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
@@ -3195,6 +3198,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         &.{},
     );
     defer runtime_observer.destroy();
+    subagent_manager_needs_err_cleanup = false;
     defer subagent_manager.deinit();
     const obs = runtime_observer.observer();
     subagent_manager.observer = runtime_observer.backendObserver();
