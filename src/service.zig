@@ -10,6 +10,7 @@ const Config = @import("config.zig").Config;
 const daemon = @import("daemon.zig");
 const http_util = @import("http_util.zig");
 const providers = @import("providers/root.zig");
+const security = @import("security/root.zig");
 
 const SERVICE_LABEL = "com.nullclaw.daemon";
 const WINDOWS_SERVICE_NAME = "nullclaw";
@@ -694,6 +695,13 @@ fn runWindowsServiceGatewayProcess(allocator: std.mem.Allocator) !void {
 
     try cfg.validate();
     try applyServiceRuntimeProviderOverrides(&cfg);
+    if (!security.isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, security.isYoloForceEnabled(allocator))) {
+        std.debug.print(
+            "Refusing to start gateway service with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
+            .{cfg.gateway.host},
+        );
+        return error.InsecureYoloGatewayBind;
+    }
 
     updateWindowsServiceStatus(SERVICE_RUNNING, SERVICE_NO_ERROR, 0);
     try daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
