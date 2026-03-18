@@ -764,17 +764,23 @@ pub const TelegramChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
+        var matched = false;
+        var wildcard_seen = false;
         for (self.allow_from) |a| {
             if (std.mem.eql(u8, a, "*")) {
-                root.warnWildcardAllowAll("telegram channel");
-                return true;
+                wildcard_seen = true;
+                continue;
             }
             // Strip leading "@" from allowlist entry.
             const trimmed = if (a.len > 1 and a[0] == '@') a[1..] else a;
             // Case-insensitive: Telegram usernames are case-insensitive
-            if (std.ascii.eqlIgnoreCase(trimmed, sender)) return true;
+            if (std.ascii.eqlIgnoreCase(trimmed, sender)) matched = true;
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("telegram channel");
+            return true;
+        }
+        return matched;
     }
 
     /// Check if any of the given identities (username, user_id) is allowed.
@@ -786,15 +792,21 @@ pub const TelegramChannel = struct {
     }
 
     pub fn isGroupUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
+        var matched = false;
+        var wildcard_seen = false;
         for (self.group_allow_from) |a| {
             if (std.mem.eql(u8, a, "*")) {
-                root.warnWildcardAllowAll("telegram channel");
-                return true;
+                wildcard_seen = true;
+                continue;
             }
             const trimmed = if (a.len > 1 and a[0] == '@') a[1..] else a;
-            if (std.ascii.eqlIgnoreCase(trimmed, sender)) return true;
+            if (std.ascii.eqlIgnoreCase(trimmed, sender)) matched = true;
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("telegram channel");
+            return true;
+        }
+        return matched;
     }
 
     pub fn isAnyGroupIdentityAllowed(self: *const TelegramChannel, identities: []const []const u8) bool {
@@ -3800,6 +3812,16 @@ test "telegram allow_from wildcard allows all" {
     try std.testing.expect(ch.isUserAllowed("admin"));
 }
 
+test "telegram exact dm match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("telegram channel");
+    defer root.resetWildcardWarningForTest("telegram channel");
+
+    const users = [_][]const u8{ "alice", "*" };
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
+    try std.testing.expect(ch.isUserAllowed("alice"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("telegram channel"));
+}
+
 test "telegram allow_from case insensitive" {
     const users = [_][]const u8{"Alice"};
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
@@ -3814,6 +3836,16 @@ test "telegram allow_from strips @ prefix" {
     try std.testing.expect(ch.isUserAllowed("alice"));
     try std.testing.expect(!ch.isUserAllowed("@alice"));
     try std.testing.expect(!ch.isUserAllowed("bob"));
+}
+
+test "telegram exact group match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("telegram channel");
+    defer root.resetWildcardWarningForTest("telegram channel");
+
+    const groups = [_][]const u8{ "group_user", "*" };
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &groups, "allowlist");
+    try std.testing.expect(ch.isGroupUserAllowed("group_user"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("telegram channel"));
 }
 
 test "telegram isAnyIdentityAllowed matches username" {
