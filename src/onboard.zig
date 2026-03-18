@@ -328,6 +328,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
+    if (std.mem.eql(u8, canonical, "novita")) return &novita_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
@@ -404,6 +405,11 @@ const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
 };
+const novita_fallback = [_][]const u8{
+    "moonshotai/kimi-k2.5",
+    "zai-org/glm-5",
+    "minimax/minimax-m2.5",
+};
 const ollama_fallback = [_][]const u8{
     "llama4",
     "llama3.2",
@@ -444,6 +450,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "minimax", .key = "minimax" },
     .{ .canonical = "cohere", .key = "cohere" },
     .{ .canonical = "perplexity", .key = "perplexity" },
+    .{ .canonical = "novita", .key = "novita" },
     .{ .canonical = "nvidia", .key = "nvidia" },
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
