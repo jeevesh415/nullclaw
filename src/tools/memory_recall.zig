@@ -23,11 +23,114 @@ pub const MemoryRecallTool = struct {
 
     pub const vtable = root.ToolVTable(@This());
 
+    const SessionSelection = struct {
+        explicit_scope: bool,
+        preferred_session_id: ?[]const u8,
+    };
+
     pub fn tool(self: *MemoryRecallTool) Tool {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &vtable,
         };
+    }
+
+    fn resolveSessionSelection(args: JsonObjectMap) SessionSelection {
+        if (args.get("session_id") != null) {
+            if (root.getString(args, "session_id")) |sid_raw| {
+                if (sid_raw.len > 0) {
+                    return .{ .explicit_scope = true, .preferred_session_id = sid_raw };
+                }
+            }
+            return .{ .explicit_scope = true, .preferred_session_id = root.threadMemorySessionId() };
+        }
+
+        return .{
+            .explicit_scope = false,
+            .preferred_session_id = root.threadMemorySessionId(),
+        };
+    }
+
+    fn containsEntryKey(entries: []const MemoryEntry, key: []const u8) bool {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return true;
+        }
+        return false;
+    }
+
+    fn containsCandidateKey(candidates: []const mem_root.RetrievalCandidate, key: []const u8) bool {
+        for (candidates) |candidate| {
+            if (std.mem.eql(u8, candidate.key, key)) return true;
+        }
+        return false;
+    }
+
+    fn appendMissingEntries(
+        allocator: std.mem.Allocator,
+        dest: *std.ArrayList(MemoryEntry),
+        entries: []const MemoryEntry,
+        limit: usize,
+    ) !void {
+        for (entries) |entry| {
+            if (dest.items.len >= limit) break;
+            if (containsEntryKey(dest.items, entry.key)) continue;
+
+            const cloned_category: mem_root.MemoryCategory = switch (entry.category) {
+                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+                else => entry.category,
+            };
+            errdefer switch (cloned_category) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            };
+
+            try dest.append(allocator, .{
+                .id = try allocator.dupe(u8, entry.id),
+                .key = try allocator.dupe(u8, entry.key),
+                .content = try allocator.dupe(u8, entry.content),
+                .category = cloned_category,
+                .timestamp = try allocator.dupe(u8, entry.timestamp),
+                .session_id = if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null,
+                .score = entry.score,
+            });
+        }
+    }
+
+    fn appendMissingCandidates(
+        allocator: std.mem.Allocator,
+        dest: *std.ArrayList(mem_root.RetrievalCandidate),
+        candidates: []const mem_root.RetrievalCandidate,
+        limit: usize,
+    ) !void {
+        for (candidates) |candidate| {
+            if (dest.items.len >= limit) break;
+            if (containsCandidateKey(dest.items, candidate.key)) continue;
+
+            const cloned_category: mem_root.MemoryCategory = switch (candidate.category) {
+                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+                else => candidate.category,
+            };
+            errdefer switch (cloned_category) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            };
+
+            try dest.append(allocator, .{
+                .id = try allocator.dupe(u8, candidate.id),
+                .key = try allocator.dupe(u8, candidate.key),
+                .content = try allocator.dupe(u8, candidate.content),
+                .snippet = try allocator.dupe(u8, candidate.snippet),
+                .category = cloned_category,
+                .keyword_rank = candidate.keyword_rank,
+                .vector_score = candidate.vector_score,
+                .final_score = candidate.final_score,
+                .source = try allocator.dupe(u8, candidate.source),
+                .source_path = try allocator.dupe(u8, candidate.source_path),
+                .start_line = candidate.start_line,
+                .end_line = candidate.end_line,
+                .created_at = candidate.created_at,
+            });
+        }
     }
 
     pub fn execute(self: *MemoryRecallTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -37,10 +140,7 @@ pub const MemoryRecallTool = struct {
 
         const limit_raw = root.getInt(args, "limit") orelse 5;
         const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
-        const session_id = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
-        else
-            root.threadMemorySessionId();
+        const selection = resolveSessionSelection(args);
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});
@@ -50,34 +150,66 @@ pub const MemoryRecallTool = struct {
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
-            const candidates = rt.search(allocator, query, limit, session_id) catch |err| {
+            const primary_candidates = rt.search(allocator, query, limit, selection.preferred_session_id) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
                 return ToolResult{ .success = false, .output = msg };
             };
-            defer mem_root.retrieval.freeCandidates(allocator, candidates);
+            defer mem_root.retrieval.freeCandidates(allocator, primary_candidates);
 
-            const visible_candidates = countVisibleCandidates(candidates);
+            var merged_candidates = std.ArrayList(mem_root.RetrievalCandidate).empty;
+            defer {
+                for (merged_candidates.items) |*candidate| candidate.deinit(allocator);
+                merged_candidates.deinit(allocator);
+            }
+            try appendMissingCandidates(allocator, &merged_candidates, primary_candidates, limit);
+
+            if (!selection.explicit_scope and selection.preferred_session_id != null and merged_candidates.items.len < limit) {
+                const global_candidates = rt.search(allocator, query, limit, null) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
+                    return ToolResult{ .success = false, .output = msg };
+                };
+                defer mem_root.retrieval.freeCandidates(allocator, global_candidates);
+                try appendMissingCandidates(allocator, &merged_candidates, global_candidates, limit);
+            }
+
+            const visible_candidates = countVisibleCandidates(merged_candidates.items);
             if (visible_candidates == 0) {
                 const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
                 return ToolResult{ .success = true, .output = msg };
             }
 
-            return formatCandidates(allocator, candidates, visible_candidates);
+            return formatCandidates(allocator, merged_candidates.items, visible_candidates);
         }
 
-        const entries = m.recall(allocator, query, limit, session_id) catch |err| {
+        const primary_entries = m.recall(allocator, query, limit, selection.preferred_session_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
-        defer mem_root.freeEntries(allocator, entries);
+        defer mem_root.freeEntries(allocator, primary_entries);
 
-        const visible_entries = countVisibleEntries(entries);
+        var merged_entries = std.ArrayList(MemoryEntry).empty;
+        defer {
+            for (merged_entries.items) |*entry| entry.deinit(allocator);
+            merged_entries.deinit(allocator);
+        }
+        try appendMissingEntries(allocator, &merged_entries, primary_entries, limit);
+
+        if (!selection.explicit_scope and selection.preferred_session_id != null and merged_entries.items.len < limit) {
+            const global_entries = m.recall(allocator, query, limit, null) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
+                return ToolResult{ .success = false, .output = msg };
+            };
+            defer mem_root.freeEntries(allocator, global_entries);
+            try appendMissingEntries(allocator, &merged_entries, global_entries, limit);
+        }
+
+        const visible_entries = countVisibleEntries(merged_entries.items);
         if (visible_entries == 0) {
             const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
             return ToolResult{ .success = true, .output = msg };
         }
 
-        return formatEntries(allocator, entries, visible_entries);
+        return formatEntries(allocator, merged_entries.items, visible_entries);
     }
 
     fn countVisibleEntries(entries: []const MemoryEntry) usize {
@@ -250,4 +382,47 @@ test "memory_recall filters internal bootstrap keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_pref") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.SOUL.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-soul") == null);
+}
+
+test "memory_recall includes global memory when current thread session is set" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("pickup.sister", "Pick up sister from Heathrow tomorrow", .daily, null);
+    try mem.store("chat.note", "Discuss airport parking", .conversation, "chat-123");
+
+    const previous = root.setThreadMemorySessionId("chat-123");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"Heathrow\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "pickup.sister") != null);
+}
+
+test "memory_recall respects explicit session scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("pickup.sister", "Pick up sister from Heathrow tomorrow", .daily, null);
+    try mem.store("chat.note", "Discuss airport parking", .conversation, "chat-123");
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"Heathrow\", \"session_id\": \"chat-123\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "pickup.sister") == null);
 }
