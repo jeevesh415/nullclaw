@@ -18,10 +18,11 @@ pub const MemoryRecallTool = struct {
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"session_id":{"type":"string","description":"Optional session scope. Omit to search the current session plus global memory; pass an empty string to search only the current thread session."}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
+    const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
 
     const SessionSelection = struct {
         explicit_scope: bool,
@@ -133,6 +134,18 @@ pub const MemoryRecallTool = struct {
         }
     }
 
+    fn partitionGlobalEntries(entries: []MemoryEntry) usize {
+        var global_count: usize = 0;
+        for (entries, 0..) |_, i| {
+            if (entries[i].session_id != null) continue;
+            if (global_count != i) {
+                std.mem.swap(MemoryEntry, &entries[global_count], &entries[i]);
+            }
+            global_count += 1;
+        }
+        return global_count;
+    }
+
     pub fn execute(self: *MemoryRecallTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing 'query' parameter");
@@ -164,10 +177,14 @@ pub const MemoryRecallTool = struct {
             try appendMissingCandidates(allocator, &merged_candidates, primary_candidates, limit);
 
             if (!selection.explicit_scope and selection.preferred_session_id != null and merged_candidates.items.len < limit) {
-                const global_candidates = rt.search(allocator, query, limit, null) catch |err| {
-                    const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
+                var global_entries = m.recall(allocator, query, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to recall global memories for '{s}': {s}", .{ query, @errorName(err) });
                     return ToolResult{ .success = false, .output = msg };
                 };
+                defer mem_root.freeEntries(allocator, global_entries);
+
+                const global_count = partitionGlobalEntries(global_entries);
+                const global_candidates = try mem_root.retrieval.entriesToCandidates(allocator, global_entries[0..global_count]);
                 defer mem_root.retrieval.freeCandidates(allocator, global_candidates);
                 try appendMissingCandidates(allocator, &merged_candidates, global_candidates, limit);
             }
@@ -195,12 +212,13 @@ pub const MemoryRecallTool = struct {
         try appendMissingEntries(allocator, &merged_entries, primary_entries, limit);
 
         if (!selection.explicit_scope and selection.preferred_session_id != null and merged_entries.items.len < limit) {
-            const global_entries = m.recall(allocator, query, limit, null) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
+            var global_entries = m.recall(allocator, query, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to recall global memories for '{s}': {s}", .{ query, @errorName(err) });
                 return ToolResult{ .success = false, .output = msg };
             };
             defer mem_root.freeEntries(allocator, global_entries);
-            try appendMissingEntries(allocator, &merged_entries, global_entries, limit);
+            const global_count = partitionGlobalEntries(global_entries);
+            try appendMissingEntries(allocator, &merged_entries, global_entries[0..global_count], limit);
         }
 
         const visible_entries = countVisibleEntries(merged_entries.items);
@@ -311,6 +329,7 @@ test "memory_recall schema has query" {
     const t = mt.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "session_id") != null);
 }
 
 test "memory_recall executes without backend" {
@@ -384,14 +403,15 @@ test "memory_recall filters internal bootstrap keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-soul") == null);
 }
 
-test "memory_recall includes global memory when current thread session is set" {
+test "memory_recall includes global memory without cross-session bleed" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
     try mem.store("pickup.sister", "Pick up sister from Heathrow tomorrow", .daily, null);
-    try mem.store("chat.note", "Discuss airport parking", .conversation, "chat-123");
+    try mem.store("chat.note", "Discuss Heathrow parking", .conversation, "chat-123");
+    try mem.store("other.note", "Drop luggage at Heathrow terminal 3", .conversation, "chat-999");
 
     const previous = root.setThreadMemorySessionId("chat-123");
     defer _ = root.setThreadMemorySessionId(previous);
@@ -405,6 +425,66 @@ test "memory_recall includes global memory when current thread session is set" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "pickup.sister") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "chat.note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "other.note") == null);
+}
+
+test "memory_recall runtime includes global memory without cross-session bleed" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("pickup.sister", "Pick up sister from Heathrow tomorrow", .daily, null);
+    try mem.store("chat.note", "Discuss Heathrow parking", .conversation, "chat-123");
+    try mem.store("other.note", "Drop luggage at Heathrow terminal 3", .conversation, "chat-999");
+
+    const resolved = mem_root.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = mem_root.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const previous = root.setThreadMemorySessionId("chat-123");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryRecallTool{ .memory = mem, .mem_rt = &rt };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"Heathrow\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "pickup.sister") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "chat.note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "other.note") == null);
 }
 
 test "memory_recall respects explicit session scope" {
