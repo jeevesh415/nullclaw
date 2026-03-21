@@ -2462,6 +2462,17 @@ fn printNoMessagingChannelConfiguredHint() void {
     std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
 }
 
+const ChannelStartBusDrainCtx = struct {
+    allocator: std.mem.Allocator,
+    bus: *yc.bus.Bus,
+};
+
+fn drainChannelStartBus(ctx: *const ChannelStartBusDrainCtx) void {
+    while (ctx.bus.consumeInbound()) |msg| {
+        msg.deinit(ctx.allocator);
+    }
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len > 0 and std.mem.eql(u8, args[0], "--all")) {
         std.debug.print("Use `nullclaw gateway` to start all configured channels/accounts.\n", .{});
@@ -2569,8 +2580,21 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
     var registry = yc.channels.dispatch.ChannelRegistry.init(allocator);
     defer registry.deinit();
 
+    // Use a drain-only bus so `channel start` can exercise inbound wiring
+    // without leaking or stalling if the user sends test messages.
+    var event_bus = yc.bus.Bus.init();
+    var drain_ctx = ChannelStartBusDrainCtx{
+        .allocator = allocator,
+        .bus = &event_bus,
+    };
+    const drain_thread = try std.Thread.spawn(.{}, drainChannelStartBus, .{&drain_ctx});
+    defer drain_thread.join();
+    defer event_bus.close();
+
     const mgr = try yc.channel_manager.ChannelManager.init(allocator, config, &registry);
     defer mgr.deinit();
+
+    mgr.setEventBus(&event_bus);
 
     try mgr.collectConfiguredChannels();
 
