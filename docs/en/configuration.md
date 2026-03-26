@@ -410,6 +410,35 @@ Telegram example:
 }
 ```
 
+WeChat example:
+
+```json
+{
+  "channels": {
+    "wechat": [
+      {
+        "account_id": "main",
+        "callback_token": "wechat-callback-token",
+        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "app_id": "wx1234567890abcdef",
+        "app_secret": "wechat-app-secret",
+        "allow_from": ["openid_123"]
+      }
+    ]
+  }
+}
+```
+
+WeChat notes:
+
+- NullClaw already supports WeChat as a built-in webhook channel; you do not need an external plugin to receive Official Account callbacks.
+- The gateway webhook path is `/wechat`. Use `?account_id=<id>` when you have multiple configured WeChat accounts.
+- `callback_token` is required for signature verification.
+- `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
+- `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
+- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
+
 Telegram forum topics:
 
 - Topic session isolation is automatic; there is no separate `topic_id` field under `channels.telegram`.
