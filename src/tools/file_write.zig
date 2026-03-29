@@ -7,8 +7,11 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
+const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Write file contents with workspace path scoping.
 pub const FileWriteTool = struct {
@@ -237,25 +240,6 @@ pub const FileWriteTool = struct {
         return ToolResult{ .success = true, .output = msg, .error_msg = null };
     }
 };
-
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
-
-fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
-    if (std.fs.path.isAbsolute(path)) return null;
-    const basename = std.fs.path.basename(path);
-    if (!std.mem.eql(u8, basename, path)) return null;
-    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
-    return basename;
-}
 
 fn isSymlinkPath(path: []const u8) !bool {
     const dir_path = std.fs.path.dirname(path) orelse ".";
