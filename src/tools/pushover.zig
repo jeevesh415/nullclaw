@@ -486,7 +486,7 @@ test "getCredentials prefers process environment over .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
     });
@@ -512,7 +512,7 @@ test "getCredentials fills missing environment value from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
     });
@@ -536,7 +536,7 @@ test "getCredentials later .env entries override earlier ones" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=first-token
         \\PUSHOVER_TOKEN=second-token
         \\PUSHOVER_USER_KEY=first-user-key

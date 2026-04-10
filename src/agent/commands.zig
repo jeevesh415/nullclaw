@@ -8,6 +8,7 @@ const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
+const config_paths = @import("../config_paths.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const interaction_choices = @import("../interactions/choices.zig");
@@ -3534,7 +3535,7 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
 
     const config_path = try config_mutator.defaultConfigPath(allocator);
     const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
-    const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+    const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_module.Config{
         .workspace_dir = default_workspace_dir,

@@ -2383,7 +2383,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 8: Workspace path ──
-    const default_workspace = try getDefaultWorkspace(allocator);
+    const default_workspace = cfg.workspace_dir;
     try out.print("  Step 8/8: Workspace path [{s}]: ", .{default_workspace});
     const ws_input = prompt(out, &input_buf, "", default_workspace) orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -3154,26 +3154,63 @@ pub fn defaultBackendKey() []const u8 {
 // ── Path helpers ─────────────────────────────────────────────────
 
 fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
-    const config_dir = try config_paths.defaultConfigDir(allocator);
-    defer allocator.free(config_dir);
-    return defaultWorkspaceFromConfigDir(allocator, config_dir);
+    return config_paths.defaultWorkspaceDir(allocator);
 }
 
 fn getDefaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
     const config_dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(config_dir);
-    return defaultConfigPathFromDir(allocator, config_dir);
-}
-
-fn defaultWorkspaceFromConfigDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
-    return std.fs.path.join(allocator, &.{ config_dir, "workspace" });
-}
-
-fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
     return config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "getDefaultWorkspace prefers NULLCLAW_WORKSPACE override" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(key_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-test-workspace");
+    defer std.testing.allocator.free(value_z);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    const workspace = try getDefaultWorkspace(std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-test-workspace", workspace);
+}
+
+test "initFreshConfig honors NULLCLAW_HOME and NULLCLAW_WORKSPACE overrides" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const home_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer std.testing.allocator.free(home_key_z);
+    const home_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(home_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(home_key_z.ptr, home_value_z.ptr, 1));
+    defer _ = c.unsetenv(home_key_z.ptr);
+
+    const workspace_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(workspace_key_z);
+    const workspace_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home/workspace-custom");
+    defer std.testing.allocator.free(workspace_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(workspace_key_z.ptr, workspace_value_z.ptr, 1));
+    defer _ = c.unsetenv(workspace_key_z.ptr);
+
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/workspace-custom", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/config.json", cfg.config_path);
+}
 
 test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("xai", canonicalProviderName("grok"));
@@ -3300,26 +3337,6 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(isWizardInteractiveChannel(.max));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
-}
-
-test "defaultWorkspaceFromConfigDir appends workspace" {
-    const path = try defaultWorkspaceFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
-    defer std.testing.allocator.free(path);
-
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "workspace" });
-    defer std.testing.allocator.free(expected);
-
-    try std.testing.expectEqualStrings(expected, path);
-}
-
-test "defaultConfigPathFromDir appends config.json" {
-    const path = try defaultConfigPathFromDir(std.testing.allocator, "/tmp/nullclaw-home");
-    defer std.testing.allocator.free(path);
-
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "config.json" });
-    defer std.testing.allocator.free(expected);
-
-    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "parseWizardJsonConfig normalizes valid object payload" {

@@ -432,7 +432,7 @@ pub const Config = struct {
             else => return err,
         };
         const config_path = try config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
-        const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+        const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
         var cfg = Config{
             .workspace_dir = default_workspace_dir, // temporarily set to default
