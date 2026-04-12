@@ -27,6 +27,8 @@ const provider_runtime = @import("providers/runtime_bundle.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
+const fs_compat = @import("fs_compat.zig");
+const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -36,17 +38,87 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
 
+fn hasNonEmptyCredential(value: ?[]const u8) bool {
+    const credential = value orelse return false;
+    return std.mem.trim(u8, credential, " \t\r\n").len > 0;
+}
+
+fn providerHasStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    provider_name: []const u8,
+) bool {
+    const resolved_key = providers.resolveApiKeyFromConfig(
+        allocator,
+        provider_name,
+        config.providers,
+    ) catch null;
+    defer if (resolved_key) |key| allocator.free(key);
+
+    if (hasNonEmptyCredential(resolved_key)) return true;
+
+    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        allocator,
+        provider_name,
+        null,
+        config.getProviderBaseUrl(provider_name),
+        config.getProviderNativeTools(provider_name),
+        config.getProviderUserAgent(provider_name),
+        config.getProviderApiMode(provider_name),
+        config.getProviderMaxStreamingPromptBytes(provider_name),
+        config.getProviderChatTemplateEnableThinkingParam(provider_name),
+        config.getProviderExtraBodyParams(provider_name),
+    );
+    defer holder.deinit();
+
+    return switch (holder) {
+        .ollama => true,
+        .claude_cli, .codex_cli, .gemini_cli => true,
+        .openai_codex => |provider| provider.access_token != null,
+        .gemini => |provider| provider.auth != null,
+        .vertex => |provider| provider.auth != null and provider.base != null,
+        .compatible => !provider_probe.providerRequiresApiKey(provider_name, config.getProviderBaseUrl(provider_name)),
+        else => false,
+    };
+}
+
+fn hasReliabilityCredentialFallback(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    for (config.reliability.api_keys) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (providerHasStartupCredentials(allocator, config, provider_name)) return true;
+    }
+
+    return false;
+}
+
+pub fn hasStartupProviderCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    if (providerHasStartupCredentials(allocator, config, config.default_provider)) return true;
+    return hasReliabilityCredentialFallback(allocator, config);
+}
+
 /// Set ScheduleTool's default chat_id for delivery context.
 fn setScheduleToolContext(
     tools: []const tools_mod.Tool,
     channel: ?[]const u8,
     account_id: ?[]const u8,
     chat_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+    thread_id: ?[]const u8,
 ) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext(channel, account_id, chat_id);
+            schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, thread_id);
             break;
         }
     }
@@ -58,6 +130,61 @@ fn setScheduleToolContext(
 
 fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+}
+
+fn detailedProviderErrorForDisplay(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+) !?[]u8 {
+    switch (err) {
+        error.ApiError, error.ProviderError, error.AllProvidersFailed => {},
+        else => return null,
+    }
+
+    const detail = try providers.snapshotLastApiErrorDetail(allocator);
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len == 0) return null;
+        const formatted = try std.fmt.allocPrint(allocator, "Provider API error: {s}", .{owned});
+        return formatted;
+    }
+    return null;
+}
+
+fn logAgentProcessingError(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    err: anyerror,
+) void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len > 0) {
+            log.err("{s}: {} ({s})", .{ prefix, err, owned });
+            return;
+        }
+    }
+    log.err("{s}: {}", .{ prefix, err });
+}
+
+fn defaultAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+        error.OutOfMemory => "Out of memory.",
+        else => "An error occurred. Try again or /new for a fresh session.",
+    };
+}
+
+fn compactAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+        error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
+        else => "An error occurred. Try again.",
+    };
 }
 
 const TelegramSessionTarget = struct {
@@ -737,6 +864,7 @@ fn processTelegramMessage(
     is_group: bool,
     reply_to_id: ?i64,
     message_sender_id: []const u8,
+    replace_message: bool,
 ) void {
     const typing_target = sender;
     const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
@@ -746,13 +874,30 @@ fn processTelegramMessage(
     }
 
     // Set ScheduleTool context for delivery.
-    setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
-    defer setScheduleToolContext(runtime.tools, null, null, null);
+    var schedule_thread_buf: [32]u8 = undefined;
+    const schedule_thread_id = if (is_group)
+        if (telegram.targetThreadId(sender)) |thread_id|
+            std.fmt.bufPrint(&schedule_thread_buf, "{d}", .{thread_id}) catch null
+        else
+            null
+    else
+        null;
+    setScheduleToolContext(
+        runtime.tools,
+        "telegram",
+        tg_ptr.account_id,
+        sender,
+        if (is_group) .group else .direct,
+        if (is_group) telegram.targetChatId(sender) else sender,
+        schedule_thread_id,
+    );
+    defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
     const conversation_context = buildConversationContext(.{
         .channel = "telegram",
         .account_id = tg_ptr.account_id,
+        .delivery_chat_id = sender,
         .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
@@ -767,16 +912,11 @@ fn processTelegramMessage(
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
-        log.err("Agent error: {}", .{err});
+        logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
-        const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-            error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-            error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-            error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-            error.OutOfMemory => "Out of memory.",
-            else => "An error occurred. Try again or /new for a fresh session.",
-        };
+        const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+        defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+        const err_msg = owned_err_msg orelse defaultAgentErrorMessage(err);
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
@@ -788,11 +928,35 @@ fn processTelegramMessage(
         return;
     }
 
-    tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
-        tg_ptr.setTaskReaction(sender, message_id, .failed);
-        log.warn("Send error: {}", .{err});
-        return;
-    };
+    if (replace_message and message_id != null) {
+        var payload = telegram.buildOwnedOutboundPayloadFromLegacy(allocator, reply, &.{}, true) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Failed to build telegram edit payload: {}", .{err});
+            return;
+        };
+        defer payload.deinit(allocator);
+        const edit_message_id = std.fmt.allocPrint(allocator, "{d}", .{message_id.?}) catch {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            return;
+        };
+        defer allocator.free(edit_message_id);
+
+        tg_ptr.editRichMessage(.{
+            .target = sender,
+            .message_id = edit_message_id,
+            .payload = payload.payload(),
+        }) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Edit error: {}", .{err});
+            return;
+        };
+    } else {
+        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Send error: {}", .{err});
+            return;
+        };
+    }
     tg_ptr.setTaskReaction(sender, message_id, .done);
 }
 
@@ -808,6 +972,7 @@ const MessageTask = struct {
     is_group: bool,
     reply_to_id: ?i64,
     message_sender_id: []const u8,
+    replace_message: bool,
 
     fn run(task: *MessageTask) void {
         processTelegramMessage(
@@ -821,6 +986,7 @@ const MessageTask = struct {
             task.is_group,
             task.reply_to_id,
             task.message_sender_id,
+            task.replace_message,
         );
     }
 
@@ -872,7 +1038,16 @@ fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config,
     const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
     defer allocator.free(file_name);
 
-    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    const relative_path = try std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    defer allocator.free(relative_path);
+
+    if (std.fs.path.isAbsolute(relative_path)) {
+        return std.fs.path.resolve(allocator, &.{relative_path});
+    }
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, relative_path });
 }
 
 /// Load persisted Telegram update offset. Returns null when missing/invalid/stale.
@@ -929,7 +1104,7 @@ pub fn saveTelegramUpdateOffset(
     if (std.fs.path.dirname(path)) |dir| {
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
-            else => try std.fs.cwd().makePath(dir),
+            else => try fs_compat.makePath(dir),
         };
     }
 
@@ -1107,6 +1282,8 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
+            .sandbox_backend = config.security.sandbox.backend,
+            .sandbox_enabled = config.sandboxEnabled(),
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
@@ -1228,7 +1405,7 @@ pub fn runTelegramLoop(
     var evict_counter: u32 = 0;
 
     const model = config.default_model orelse {
-        log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.", .{});
+        log.err("No default model configured. Set agents.defaults.model.primary in config.json in your nullclaw config directory or run `nullclaw onboard`.", .{});
         return;
     };
 
@@ -1407,6 +1584,7 @@ pub fn runTelegramLoop(
                         .is_group = msg.is_group,
                         .reply_to_id = reply_to_id,
                         .message_sender_id = task_message_sender_id,
+                        .replace_message = msg.replace_message,
                     };
 
                     const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
@@ -1462,6 +1640,7 @@ pub fn runTelegramLoop(
                 msg.is_group,
                 reply_to_id,
                 msg.id,
+                msg.replace_message,
             );
         }
 
@@ -1547,8 +1726,16 @@ pub fn runSignalLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "signal", sg_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "signal",
+                sg_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) signalGroupPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
@@ -1586,21 +1773,17 @@ pub fn runSignalLoop(
                 .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                 .sender_uuid = msg.sender_uuid,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Signal agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Signal agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 if (msg.reply_target) |target| {
                     sg_ptr.sendMessage(target, err_msg, &.{}) catch |send_err| log.err("failed to send signal error reply: {}", .{send_err});
                 }
@@ -1787,8 +1970,16 @@ pub fn runMatrixLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "matrix", mx_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "matrix",
+                mx_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) matrixRoomPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             var key_buf: [192]u8 = undefined;
             const room_peer_id = matrixRoomPeerId(msg.reply_target);
@@ -1820,21 +2011,17 @@ pub fn runMatrixLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = typing_target,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Matrix agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Matrix agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
@@ -1927,8 +2114,16 @@ pub fn runMaxLoop(
 
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "max", mx_ptr.account_id, reply_target);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "max",
+                mx_ptr.account_id,
+                reply_target,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) reply_target else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
             max_mod.setInteractiveOwnerContext(msg.sender);
             defer max_mod.setInteractiveOwnerContext(null);
 
@@ -1961,6 +2156,7 @@ pub fn runMaxLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "max",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = reply_target,
                 .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,
@@ -1973,15 +2169,10 @@ pub fn runMaxLoop(
             const sink = mx_ptr.makeSink(&stream_ctx);
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
-                log.err("Max agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Max agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
                 continue;
             };
@@ -2393,6 +2584,62 @@ test "telegram update offset store roundtrip" {
     try std.testing.expectEqual(@as(?i64, 777), restored);
 }
 
+test "telegram update offset path resolves relative config path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const relative_base = try std.fs.path.relative(allocator, cwd, base);
+    defer allocator.free(relative_base);
+    const config_path = try std.fs.path.join(allocator, &.{ relative_base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const resolved = try telegramUpdateOffsetPath(allocator, &cfg, "default");
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &.{ base, "state", "telegram", "update-offset-default.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    const msg = (try detailedProviderErrorForDisplay(allocator, error.ApiError)).?;
+    defer allocator.free(msg);
+
+    try std.testing.expectEqualStrings("Provider API error: compatible: status=429 message=Rate limit exceeded", msg);
+}
+
+test "detailedProviderErrorForDisplay ignores non-provider errors" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    try std.testing.expect((try detailedProviderErrorForDisplay(allocator, error.OutOfMemory)) == null);
+}
+
+test "compactAgentErrorMessage keeps non-telegram fallback concise" {
+    // Regression: Signal/Matrix/Max should not inherit Telegram's `/new` guidance for generic failures.
+    try std.testing.expectEqualStrings("An error occurred. Try again.", compactAgentErrorMessage(error.Unexpected));
+}
+
 test "telegram update offset store returns null for mismatched bot id" {
     const allocator = std.testing.allocator;
 
@@ -2437,7 +2684,7 @@ test "telegram update offset store treats legacy payload without bot_id as stale
     const offset_dir = std.fs.path.dirname(offset_path).?;
     std.fs.makeDirAbsolute(offset_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(offset_dir),
+        else => try fs_compat.makePath(offset_dir),
     };
     const file = try std.fs.createFileAbsolute(offset_path, .{});
     defer file.close();

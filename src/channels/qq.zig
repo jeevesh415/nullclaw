@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -143,7 +144,7 @@ fn attachmentCacheDirPath(allocator: std.mem.Allocator) ![]u8 {
 fn ensureAttachmentCacheDir(cache_dir: []const u8) !void {
     std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(cache_dir),
+        else => try fs_compat.makePath(cache_dir),
     };
 }
 
@@ -460,6 +461,32 @@ pub fn buildSendBody(
     try body_list.appendSlice(allocator, "}");
 
     return body_list.toOwnedSlice(allocator);
+}
+
+fn targetWithoutMessageId(buf: []u8, target: []const u8) ?[]const u8 {
+    const msg_type, const id_str, const msg_id = parseTarget(target);
+    if (msg_id == null) return null;
+
+    if (std.mem.eql(u8, msg_type, "c2c") or std.mem.eql(u8, msg_type, "group")) {
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ msg_type, id_str }) catch null;
+    }
+    return null;
+}
+
+fn sendWithReplyFallback(
+    target: []const u8,
+    fallback_target: ?[]const u8,
+    log_context: []const u8,
+    sender: anytype,
+) !void {
+    sender.send(target) catch |err| {
+        if (err == error.QQApiError and fallback_target != null) {
+            log.warn("QQ {s} send failed; retrying without msg_id target={s}", .{ log_context, fallback_target.? });
+            try sender.send(fallback_target.?);
+        } else {
+            return err;
+        }
+    };
 }
 
 /// Build a media upload body for QQ /files endpoint.
@@ -845,6 +872,9 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
+        if (self.config.receive_mode == .websocket) {
+            return self.running.load(.acquire) and self.ws_fd.load(.acquire) != invalid_socket;
+        }
         const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
         self.allocator.free(result.token);
         return true;
@@ -1255,10 +1285,31 @@ pub const QQChannel = struct {
     ///   "user:<user_openid>"    — alias for c2c
     ///   "<user_openid>"         — defaults to c2c (zeroclaw parity)
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
+        const ChunkSend = struct {
+            channel: *QQChannel,
+            chunk: []const u8,
+            msg_seq: ?u32,
+
+            fn send(ctx: *@This(), send_target: []const u8) !void {
+                try ctx.channel.sendChunk(send_target, ctx.chunk, ctx.msg_seq);
+            }
+        };
+        const MediaSend = struct {
+            channel: *QQChannel,
+            image_url: []const u8,
+            msg_seq: ?u32,
+
+            fn send(ctx: *@This(), send_target: []const u8) !void {
+                try ctx.channel.sendMedia(send_target, ctx.image_url, ctx.msg_seq);
+            }
+        };
+
         const parsed_target = parseTarget(target);
         const msg_type = parsed_target[0];
         const msg_id = parsed_target[2];
         const supports_media_upload = std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c");
+        var fallback_target_buf: [256]u8 = undefined;
+        const fallback_target = targetWithoutMessageId(&fallback_target_buf, target);
 
         var msg_seq: u32 = 1;
         if (supports_media_upload) {
@@ -1268,7 +1319,12 @@ pub const QQChannel = struct {
             if (parsed.text.len > 0) {
                 var text_it = root.splitMessage(parsed.text, MAX_MESSAGE_LEN);
                 while (text_it.next()) |chunk| {
-                    try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+                    var chunk_send = ChunkSend{
+                        .channel = self,
+                        .chunk = chunk,
+                        .msg_seq = if (msg_id != null) msg_seq else null,
+                    };
+                    try sendWithReplyFallback(target, fallback_target, "reply", &chunk_send);
                     if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                         msg_seq += 1;
                     }
@@ -1276,7 +1332,12 @@ pub const QQChannel = struct {
             }
 
             for (parsed.image_urls) |image_url| {
-                try self.sendMedia(target, image_url, if (msg_id != null) msg_seq else null);
+                var media_send = MediaSend{
+                    .channel = self,
+                    .image_url = image_url,
+                    .msg_seq = if (msg_id != null) msg_seq else null,
+                };
+                try sendWithReplyFallback(target, fallback_target, "media reply", &media_send);
                 if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                     msg_seq += 1;
                 }
@@ -1286,7 +1347,12 @@ pub const QQChannel = struct {
 
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
-            try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+            var chunk_send = ChunkSend{
+                .channel = self,
+                .chunk = chunk,
+                .msg_seq = if (msg_id != null) msg_seq else null,
+            };
+            try sendWithReplyFallback(target, fallback_target, "reply", &chunk_send);
             if (msg_id != null and msg_seq < std.math.maxInt(u32)) msg_seq += 1;
         }
     }
@@ -2129,6 +2195,22 @@ test "qq QQChannel init stores config" {
     try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
 }
 
+test "qq healthCheck websocket requires running socket" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .receive_mode = .websocket });
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    const fake_socket: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(1)
+    else
+        42;
+    ch.ws_fd.store(fake_socket, .release);
+    try std.testing.expect(ch.healthCheck());
+}
+
 test "qq QQChannel vtable compiles" {
     const vtable_instance = QQChannel.vtable;
     try std.testing.expect(vtable_instance.start == &QQChannel.vtableStart);
@@ -2653,6 +2735,59 @@ test "qq parseTarget group with msg_id" {
     try std.testing.expectEqualStrings("group", msg_type);
     try std.testing.expectEqualStrings("openid_abc", id);
     try std.testing.expectEqualStrings("msg_def456", mid.?);
+}
+
+// Regression: QQ delayed replies may need to fall back to a plain target without msg_id.
+test "qq targetWithoutMessageId strips reply msg_id for c2c and group" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("c2c:openid_xyz", targetWithoutMessageId(&buf, "c2c:openid_xyz:msg_abc123").?);
+    try std.testing.expectEqualStrings("group:openid_abc", targetWithoutMessageId(&buf, "group:openid_abc:msg_def456").?);
+    try std.testing.expect(targetWithoutMessageId(&buf, "channel:abc:def") == null);
+    try std.testing.expect(targetWithoutMessageId(&buf, "c2c:openid_xyz") == null);
+}
+
+// Regression: issue #722 must retry delayed QQ replies without msg_id after API failure.
+test "qq sendWithReplyFallback retries QQApiError with plain target" {
+    const Sender = struct {
+        allocator: std.mem.Allocator,
+        calls: std.ArrayListUnmanaged([]const u8) = .empty,
+        fail_first: bool = true,
+
+        fn deinit(self: *@This()) void {
+            self.calls.deinit(self.allocator);
+        }
+
+        fn send(self: *@This(), send_target: []const u8) !void {
+            try self.calls.append(self.allocator, send_target);
+            if (self.fail_first) {
+                self.fail_first = false;
+                return error.QQApiError;
+            }
+        }
+    };
+
+    var sender = Sender{ .allocator = std.testing.allocator };
+    defer sender.deinit();
+
+    try sendWithReplyFallback("group:openid_abc:msg_def456", "group:openid_abc", "reply", &sender);
+    try std.testing.expectEqual(@as(usize, 2), sender.calls.items.len);
+    try std.testing.expectEqualStrings("group:openid_abc:msg_def456", sender.calls.items[0]);
+    try std.testing.expectEqualStrings("group:openid_abc", sender.calls.items[1]);
+}
+
+test "qq sendWithReplyFallback does not retry without plain target" {
+    const Sender = struct {
+        calls: usize = 0,
+
+        fn send(self: *@This(), _: []const u8) !void {
+            self.calls += 1;
+            return error.QQApiError;
+        }
+    };
+
+    var sender = Sender{};
+    try std.testing.expectError(error.QQApiError, sendWithReplyFallback("channel:abc", null, "reply", &sender));
+    try std.testing.expectEqual(@as(usize, 1), sender.calls);
 }
 
 test "qq sendChunk rejects unsupported target type" {

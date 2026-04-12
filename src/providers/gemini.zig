@@ -12,6 +12,7 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn parseExpiresIn(v: std.json.Value) ?i64 {
     return switch (v) {
@@ -648,35 +649,38 @@ pub const GeminiProvider = struct {
         // Extract text and thinking from candidates.
         // Parts with "thought": true are reasoning traces; all others are visible content.
         if (root_obj.get("candidates")) |candidates| {
-            if (candidates.array.items.len > 0) {
+            if (candidates == .array and candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
                 if (candidate.get("content")) |content| {
-                    if (content.object.get("parts")) |parts| {
-                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer text_buf.deinit(allocator);
-                        var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer thought_buf.deinit(allocator);
+                    if (content == .object) {
+                        if (content.object.get("parts")) |parts| {
+                            if (parts != .array) return error.NoResponseContent;
+                            var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer text_buf.deinit(allocator);
+                            var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer thought_buf.deinit(allocator);
 
-                        for (parts.array.items) |part_val| {
-                            const part = part_val.object;
-                            const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
-                            if (part.get("text")) |text| {
-                                if (text == .string and text.string.len > 0) {
-                                    const buf = if (is_thought) &thought_buf else &text_buf;
-                                    if (buf.items.len > 0) try buf.append(allocator, '\n');
-                                    try buf.appendSlice(allocator, text.string);
+                            for (parts.array.items) |part_val| {
+                                const part = part_val.object;
+                                const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
+                                if (part.get("text")) |text| {
+                                    if (text == .string and text.string.len > 0) {
+                                        const buf = if (is_thought) &thought_buf else &text_buf;
+                                        if (buf.items.len > 0) try buf.append(allocator, '\n');
+                                        try buf.appendSlice(allocator, text.string);
+                                    }
                                 }
                             }
+
+                            if (text_buf.items.len == 0 and thought_buf.items.len == 0)
+                                return error.NoResponseContent;
+
+                            return .{
+                                .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                                .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                                .usage = usage,
+                            };
                         }
-
-                        if (text_buf.items.len == 0 and thought_buf.items.len == 0)
-                            return error.NoResponseContent;
-
-                        return .{
-                            .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
-                            .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
-                            .usage = usage,
-                        };
                     }
                 }
             }
@@ -789,6 +793,10 @@ pub const GeminiProvider = struct {
             argv_buf[argc] = timeout_str;
             argc += 1;
         }
+
+        // Match the generic SSE helper: if the stream goes idle for 60 seconds,
+        // let curl fail fast instead of waiting for the full --max-time budget.
+        sse.appendCurlStallDetectionArgs(argv_buf[0..], &argc);
 
         argv_buf[argc] = "-X";
         argc += 1;
@@ -1086,11 +1094,20 @@ pub const GeminiProvider = struct {
         return stream_result catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Gemini streaming failed with {}; falling back to non-streaming response", .{err});
-                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
         };
+    }
+
+    pub fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
+        }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 };
 
@@ -1351,6 +1368,14 @@ test "parseResponse empty candidates fails" {
     try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
+test "parseResponse null candidates fails" {
+    // Regression: provider response parsing must tolerate `"candidates": null`.
+    const body =
+        \\{"candidates":null}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
+}
+
 test "parseResponse no text field fails" {
     const body =
         \\{"candidates":[{"content":{"parts":[{}]}}]}
@@ -1397,6 +1422,13 @@ test "parseChatResponse thought only leaves content null" {
     }
     try std.testing.expect(response.content == null);
     try std.testing.expectEqualStrings("only thinking", response.reasoning_content.?);
+}
+
+test "parseChatResponse null parts fails cleanly" {
+    const body =
+        \\{"candidates":[{"content":{"parts":null}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseChatResponse(std.testing.allocator, body));
 }
 
 test "provider rejects whitespace key" {
@@ -1486,6 +1518,14 @@ test "parseGeminiSseLine invalid json returns error" {
         error.InvalidSseJson,
         GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
     );
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: Gemini/Vertex must not wait the full message_timeout_secs
+    // twice when both the streaming and fallback paths are slow.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), GeminiProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(300));
 }
 
 test "streamChatImpl fails without credentials" {

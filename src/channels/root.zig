@@ -64,6 +64,10 @@ pub const ChannelMessage = struct {
     reply_target: ?[]const u8 = null,
     /// Platform message ID (e.g. Telegram message_id for reply-to).
     message_id: ?i64 = null,
+    /// Whether the reply should replace the originating platform message.
+    replace_message: bool = false,
+    /// Whether this message resulted from an explicit user interaction (e.g. button click).
+    is_interaction: bool = false,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
@@ -284,6 +288,8 @@ pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
+pub const wechat = @import("wechat.zig");
+pub const wecom = @import("wecom.zig");
 pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
